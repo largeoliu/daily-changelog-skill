@@ -194,6 +194,10 @@ python3 scripts/context_fetcher.py \
 
 先将生成的日志写入临时文件，再校验结构；校验通过后再保存到用户指定的位置，文件中保留标题和更新日志正文。
 
+- `/tmp/changelog_report.txt`、`/tmp/final_changelog.md` 这类路径只是临时中转文件，**用完后要删除**，不要长期留在 `/tmp`
+- 如果需要多次重试，优先覆盖旧的临时文件，避免误读上一次生成结果
+- 如果中途失败退出，也要在下一次执行前清理或重建临时文件
+
 如果用户要求“按天输出并汇总成一个文件”：
 
 - 按日期逐天执行 Step 1 ~ Step 4
@@ -208,3 +212,4 @@ python3 scripts/changelog_guard.py --file /tmp/final_changelog.md --order $ORDER
 - `$ORDER` 取值：`desc`、`asc`、`any`
 - 如果校验失败，**不要保存无效结果**；必须回到对应日期块重新生成或重写对应条目，直到校验通过
 - 对技术词问题，优先按“重写 -> 降级 -> 最后才删除”的顺序处理，尽量保留真实的产品变更信息
+- 校验通过并完成最终保存后，删除 `/tmp/final_changelog.md` 以及本轮生成过程中使用的其他临时文件
