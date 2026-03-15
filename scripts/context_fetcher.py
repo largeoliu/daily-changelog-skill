@@ -208,30 +208,6 @@ def resolve_repo_inputs(args):
     return deduped, notices, errors
 
 
-def classify_change_type(commit_msgs):
-    """根据 commit message 启发式判断变更类型"""
-    result = {"bugfix": [], "feature": [], "refactor": [], "other": []}
-
-    for line in commit_msgs:
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(" ", 1)
-        commit_hash = parts[0]
-        commit_msg = parts[1].lower() if len(parts) > 1 else ""
-
-        if any(kw in commit_msg for kw in ["fix", "bug", "repair", "解决", "修复", "修复了"]):
-            result["bugfix"].append((commit_hash, commit_msg))
-        elif any(kw in commit_msg for kw in ["feat", "feature", "新增", "新功能", "add", "功能"]):
-            result["feature"].append((commit_hash, commit_msg))
-        elif any(kw in commit_msg for kw in ["refactor", "重构", "优化", "improve", "性能"]):
-            result["refactor"].append((commit_hash, commit_msg))
-        else:
-            result["other"].append((commit_hash, commit_msg))
-
-    return result
-
-
 def dedupe_keep_order(items):
     seen = set()
     result = []
@@ -381,7 +357,7 @@ def main():
     since = args.since
     until = args.until or since
 
-    repos, notices, errors = resolve_repo_inputs(args)
+    repos, _notices, errors = resolve_repo_inputs(args)
 
     if errors:
         print("REPO_DISCOVERY_ERROR")
@@ -389,18 +365,10 @@ def main():
             print(f"# {message}")
         sys.exit(2)
 
-    print(f"# 变更分析报告")
-    print(f"# 分析范围：{since} ~ {until}")
-    print(f"# 统计模式：按合并到主分支的时间")
-    print(f"# 分析仓库数：{len(repos)}")
-    for notice in notices:
-        print(notice)
-    
     all_results = []
     total_java = 0
     total_frontend = 0
     total_sql = 0
-    all_commit_msgs = []
     
     for repo_name, repo_path in repos:
         result = analyze_repo(repo_name, repo_path, since, until)
@@ -408,30 +376,10 @@ def main():
         total_java += len(result["java_files"])
         total_frontend += len(result["frontend_files"])
         total_sql += len(result["sql_files"])
-        all_commit_msgs.extend(result["commit_msgs"])
         
-        print(f"\n# 仓库: {repo_name} ({repo_path})")
-        print(f"#   后端变更：{len(result['java_files'])} 个 Java 文件")
-        print(f"#   前端变更：{len(result['frontend_files'])} 个前端文件")
-        print(f"#   数据库变更：{len(result['sql_files'])} 个 SQL 文件")
-        if result["topics"]:
-            print(f"#   主题候选：{', '.join(result['topics'][:8])}")
-
-    print(f"\n# 总计：")
-    print(f"#   后端变更：{total_java} 个 Java 文件")
-    print(f"#   前端变更：{total_frontend} 个前端文件")
-    print(f"#   数据库变更：{total_sql} 个 SQL 文件")
-
     if total_java == 0 and total_frontend == 0 and total_sql == 0:
-        print("\nNO_CHANGES")
+        print("NO_CHANGES")
         return
-
-    change_types = classify_change_type(all_commit_msgs)
-    print(f"\n# 变更类型统计（根据 commit message 推断）：")
-    print(f"# 🐛 Bug 修复：{len(change_types['bugfix'])} 个")
-    print(f"# ✨ 新功能：{len(change_types['feature'])} 个")
-    print(f"# 🔧 技术改造：{len(change_types['refactor'])} 个")
-    print(f"# 📝 其他：{len(change_types['other'])} 个")
 
     for result in all_results:
         repo_path = result["path"]
@@ -485,9 +433,6 @@ def main():
             for f in router_files + page_files + other_fe:
                 diff = get_file_diff(f, since, until, repo_path)
                 print(format_frontend_file(f, diff))
-
-    print(f"\n\n# ── 报告结束 ──")
-
 
 if __name__ == "__main__":
     main()
