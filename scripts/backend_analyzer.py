@@ -12,6 +12,8 @@
 import re
 import os
 
+from diff_evidence import build_compact_evidence, is_changed_diff_line
+
 GENERIC_FIELD_NAMES = {"serialversionuid"}
 GENERIC_KEYWORDS = {"service", "controller", "repository", "mapper", "impl", "dto", "vo", "query", "request", "response", "model", "entity", "domain", "common", "config"}
 NOISY_LABEL_PATTERNS = [r"json_extract", r"select\s", r"insert\s", r"update\s", r"delete\s", r"\$\.%,", r"^\[.*事件\]", r"log\."]
@@ -313,7 +315,54 @@ def analyze_diff_entry_changes(diff):
     }
 
 
-def format_java_file(file_path, diff, repo_path=None):
+def build_backend_evidence_matcher(entry_info, changes, product_signals):
+    keywords = set()
+
+    def add_keywords(items):
+        for item in items or []:
+            cleaned = item.split(" ", 1)[-1] if item.startswith(("+ ", "- ")) else item
+            cleaned = cleaned.strip()
+            if 1 < len(cleaned) <= 80:
+                keywords.add(cleaned)
+
+    if entry_info:
+        add_keywords(entry_info.get("http_routes"))
+        add_keywords(entry_info.get("dubbo_interfaces"))
+
+    add_keywords(changes.get("added_routes"))
+    add_keywords(changes.get("removed_routes"))
+    add_keywords(changes.get("added_methods"))
+    add_keywords(changes.get("removed_methods"))
+    add_keywords(changes.get("validation_changes"))
+    add_keywords(product_signals.get("added_fields"))
+    add_keywords(product_signals.get("removed_fields"))
+    add_keywords(product_signals.get("added_enum_values"))
+    add_keywords(product_signals.get("query_clues"))
+    add_keywords(product_signals.get("permission_clues"))
+    add_keywords(product_signals.get("stat_clues"))
+    add_keywords(product_signals.get("labels"))
+
+    annotation_keywords = list(BACKEND_ENTRY_ANNOTATIONS.keys()) + list(VALIDATION_ANNOTATIONS.keys())
+
+    def matcher(line):
+        if not is_changed_diff_line(line):
+            return False
+
+        stripped = line[1:].strip()
+        if any(keyword in stripped for keyword in keywords):
+            return True
+        if any(annotation in stripped for annotation in annotation_keywords):
+            return True
+        if re.search(r'\b(public|protected)\b.*\(', stripped):
+            return True
+        if any(token in stripped for token in ["@Operation", "@Parameter", "summary =", "description ="]):
+            return True
+        return False
+
+    return matcher
+
+
+def format_java_file(file_path, diff, repo_path=None, content=None, compact=False):
     """格式化单个 Java 文件的分析结果
     
     Args:
@@ -321,13 +370,14 @@ def format_java_file(file_path, diff, repo_path=None):
         diff: 文件的 diff 内容
         repo_path: 仓库路径（用于构建完整路径）
     """
-    if repo_path:
-        full_path = os.path.join(repo_path, file_path)
-    else:
-        full_path = file_path
-    
-    with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-        content = f.read()
+    if content is None:
+        if repo_path:
+            full_path = os.path.join(repo_path, file_path)
+        else:
+            full_path = file_path
+
+        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
 
     class_name = os.path.basename(file_path).replace(".java", "")
     is_interface = bool(re.search(r'\binterface\s+' + class_name, content))
@@ -358,6 +408,14 @@ def format_java_file(file_path, diff, repo_path=None):
 
     entry_info = extract_backend_entry_info(file_path, content)
     product_signals = extract_product_signals(file_path, class_name, diff)
+    changes = analyze_diff_entry_changes(diff) if diff else {
+        "added_routes": [],
+        "removed_routes": [],
+        "added_methods": [],
+        "removed_methods": [],
+        "breaking_changes": [],
+        "validation_changes": [],
+    }
     scene_anchor = extract_scene_anchor(file_path, class_name, entry_info["http_routes"] if entry_info else None)
     if entry_info:
         lines.append(f"\n▶ 入口类型：{entry_info['entry_type']}")
@@ -373,7 +431,6 @@ def format_java_file(file_path, diff, repo_path=None):
             lines.append(f"▶ 实现接口：{', '.join(entry_info['dubbo_interfaces'][:3])}")
 
         if diff:
-            changes = analyze_diff_entry_changes(diff)
             if changes['added_routes']:
                 lines.append(f"▶ 新增路由：{', '.join(changes['added_routes'])}")
             if changes['removed_routes']:
@@ -419,18 +476,26 @@ def format_java_file(file_path, diff, repo_path=None):
         lines.append("\n▶ 产品信号：")
         lines.extend(signal_lines)
 
-    lines.append(f"\n[Diff]")
-    lines.append(diff if diff else "（无法获取 diff）")
+    evidence = diff
+    if compact and diff:
+        evidence = build_compact_evidence(
+            diff,
+            build_backend_evidence_matcher(entry_info, changes, product_signals),
+        )
+
+    lines.append(f"\n[{'关键证据' if compact else 'Diff'}]")
+    lines.append(evidence if evidence else "（无法获取 diff）")
 
     return "\n".join(lines)
 
 
-def is_entry_file(file_path, repo_path=None):
+def is_entry_file(file_path, repo_path=None, content=None):
     """检查文件是否是入口层文件（包括配置类）"""
     try:
-        full_path = os.path.join(repo_path, file_path) if repo_path else file_path
-        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
+        if content is None:
+            full_path = os.path.join(repo_path, file_path) if repo_path else file_path
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
         if any(ann in content for ann in BACKEND_ENTRY_ANNOTATIONS):
             return True
         if "Config" in os.path.basename(file_path) or "Configuration" in os.path.basename(file_path):

@@ -12,6 +12,8 @@ import re
 import os
 from typing import Any, Dict, List
 
+from diff_evidence import build_compact_evidence, is_changed_diff_line
+
 IGNORE_PATTERNS = [
     r"\.spec\.ts$",
     r"\.spec\.tsx$",
@@ -190,7 +192,45 @@ def extract_frontend_product_signals(file_path, diff):
     }
 
 
-def format_frontend_file(file_path, diff):
+def build_frontend_evidence_matcher(entry_info, product_signals):
+    keywords = set()
+
+    for items in [
+        entry_info.get("added_routes"),
+        entry_info.get("removed_routes"),
+        entry_info.get("added_apis"),
+        entry_info.get("removed_apis"),
+        product_signals.get("added_paths"),
+        product_signals.get("button_labels"),
+        product_signals.get("metric_labels"),
+        product_signals.get("added_columns"),
+        product_signals.get("added_filters"),
+        product_signals.get("added_api_names"),
+    ]:
+        for item in items or []:
+            cleaned = item.strip()
+            if 1 < len(cleaned) <= 80:
+                keywords.add(cleaned)
+
+    def matcher(line):
+        if not is_changed_diff_line(line):
+            return False
+
+        stripped = line[1:].strip()
+        if any(keyword in stripped for keyword in keywords):
+            return True
+        if re.search(r'\b(path|title|label|name|placeholder|columns?|filters?|options?)\b', stripped):
+            return True
+        if re.search(r'\b(get|post|put|delete|patch)\s*\(', stripped, re.IGNORECASE):
+            return True
+        if re.search(r'<(Button|Table|Form|Select|Modal|Tabs|DatePicker|Checkbox|Radio)', stripped):
+            return True
+        return False
+
+    return matcher
+
+
+def format_frontend_file(file_path, diff, compact=False):
     """格式化单个前端文件的分析结果"""
     role = classify_frontend_file(file_path)
     entry_info = extract_frontend_entry_info(file_path, diff)
@@ -243,8 +283,15 @@ def format_frontend_file(file_path, diff):
         lines.append(f"\n▶ 产品信号：")
         lines.extend(signal_lines)
 
-    lines.append(f"\n[Diff]")
-    lines.append(diff if diff else "（无法获取 diff）")
+    evidence = diff
+    if compact and diff:
+        evidence = build_compact_evidence(
+            diff,
+            build_frontend_evidence_matcher(entry_info, product_signals),
+        )
+
+    lines.append(f"\n[{'关键证据' if compact else 'Diff'}]")
+    lines.append(evidence if evidence else "（无法获取 diff）")
 
     return "\n".join(lines)
 

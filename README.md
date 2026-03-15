@@ -48,6 +48,7 @@
 
 - `SKILL.md`：skill 的主入口与运行规则
 - `scripts/context_fetcher.py`：本地调试用分析脚本
+- `scripts/changelog_guard.py`：最终 changelog 结构校验器
 - `scripts/backend_analyzer.py`：后端变更信号提取
 - `scripts/frontend_analyzer.py`：前端变更信号提取
 - `references/changelog_template.md`：最终输出模板
@@ -58,9 +59,19 @@
 
 ```bash
 python3 scripts/context_fetcher.py --help
-python3 scripts/context_fetcher.py --since 2026-03-01 --until 2026-03-07 --repo-path /path/to/project-root
-python3 scripts/context_fetcher.py --since 2026-03-01 --repos "backend:/path/to/backend,frontend:/path/to/frontend"
+python3 scripts/context_fetcher.py --since 2026-03-01 --until 2026-03-07 --repo-path /path/to/project-root --compact
+python3 scripts/context_fetcher.py --since 2026-03-01 --repos "backend:/path/to/backend,frontend:/path/to/frontend" --compact
 ```
+
+`--compact` 会把大段 raw diff 压缩成关键证据片段，更适合交给 skill 或 LLM 继续生成最终更新日志。
+
+最终文件生成后，建议再运行结构校验，确保日期标题严格按天输出，而不是被合并成区间：
+
+```bash
+python3 scripts/changelog_guard.py --file /path/to/changelog.md --order desc --check-tech
+```
+
+如果校验失败，说明结果里出现了日期区间标题、重复日期、非法分类，或仍混入了类名、路径、文件名等技术细节，不能直接作为最终交付文件。
 
 ## 示例输出
 

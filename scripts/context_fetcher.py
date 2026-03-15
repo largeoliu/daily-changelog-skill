@@ -12,12 +12,13 @@
   python3 context_fetcher.py                              # 今天
   python3 context_fetcher.py --since 2025-03-10           # 指定日期
   python3 context_fetcher.py --since 2025-03-01 --until 2025-03-12
-  python3 context_fetcher.py --repo-path /path/to/project-root
+  python3 context_fetcher.py --repo-path /path/to/project-root --compact
   python3 context_fetcher.py --repos "backend:/path/to/backend,frontend:/path/to/frontend"
 
 说明：
   - --repo-path 可以传单个 git 仓库，也可以传包含多个子仓库的项目目录
   - 当输入路径本身不是 git 仓库时，脚本会自动发现子目录中的 git 仓库
+  - --compact 会输出关键证据片段，减少大段 raw diff
 """
 
 import subprocess
@@ -26,9 +27,11 @@ import re
 import argparse
 import shlex
 import sys
+from collections import defaultdict
 from datetime import datetime
 
 from backend_analyzer import format_java_file, is_entry_file, is_ignored_file as is_be_ignored_file, is_sql_migration_file
+from diff_evidence import build_compact_evidence, is_changed_diff_line
 from frontend_analyzer import format_frontend_file, is_router_file, is_page_file, is_ignored_file as is_fe_ignored_file
 
 TOPIC_STOP_WORDS = {
@@ -242,60 +245,102 @@ MERGE_SKIP_PATTERNS = [
     "autocreatfromdevops",
 ]
 
+MERGE_LOG_SEPARATOR = "\x1f"
+DIFF_HEADER_RE = re.compile(r'^diff --git "?a/(.+?)"? "?b/(.+?)"?$')
 
-def get_changed_files(since, until, repo_path=None):
-    """获取日期范围内合并到主分支的变动文件，按语言分类
-    
-    Args:
-        since: 开始日期
-        until: 结束日期
-        repo_path: 仓库路径
-    """
-    merge_commits = run_cmd(
+
+def parse_merge_commits(since, until, repo_path=None):
+    """获取日期范围内的 merge commit 列表。"""
+    raw_lines = run_cmd(
         f'git log --merges --after="{since} 00:00:00" --before="{until} 23:59:59" '
-        f'--format="%H %s"',
+        f'--format="%H{MERGE_LOG_SEPARATOR}%s"',
         cwd=repo_path
     ).split("\n")
 
-    valid_commit_msgs = []
-    changed = set()
-    
-    for line in merge_commits:
+    merge_commits = []
+    for line in raw_lines:
         line = line.strip()
-        if not line:
+        if not line or MERGE_LOG_SEPARATOR not in line:
             continue
-        parts = line.split(" ", 1)
-        merge_hash = parts[0]
-        commit_msg = parts[1] if len(parts) > 1 else ""
+
+        merge_hash, commit_msg = line.split(MERGE_LOG_SEPARATOR, 1)
         msg_lower = commit_msg.lower()
-        
-        # 跳过无实质内容的 merge commit
+
         if any(pattern in msg_lower for pattern in MERGE_SKIP_PATTERNS):
             continue
-        
         if any(kw in msg_lower for kw in ["refactor", "typo", "chore", "ci:", "build:"]):
             continue
-        
-        valid_commit_msgs.append(line)
-        
-        files = run_cmd(
-            f'git diff --name-only {merge_hash}^..{merge_hash}',
+
+        merge_commits.append((merge_hash, commit_msg))
+
+    return merge_commits
+
+
+def normalize_git_diff_path(path):
+    path = path.strip()
+    if path.startswith('"') and path.endswith('"'):
+        path = path[1:-1]
+    return path.replace('\\/', '/')
+
+
+def split_diff_by_file(diff_text):
+    """将一次 git diff 的输出拆分为按文件聚合的 patch。"""
+    file_diffs = {}
+    current_path = None
+    current_lines = []
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            if current_path and current_lines:
+                file_diffs[current_path] = "\n".join(current_lines)
+
+            current_path = None
+            current_lines = [line]
+
+            match = DIFF_HEADER_RE.match(line)
+            if match:
+                old_path = normalize_git_diff_path(match.group(1))
+                new_path = normalize_git_diff_path(match.group(2))
+                current_path = old_path if new_path == "/dev/null" else new_path
+            continue
+
+        if current_path is not None:
+            current_lines.append(line)
+
+    if current_path and current_lines:
+        file_diffs[current_path] = "\n".join(current_lines)
+
+    return file_diffs
+
+
+def collect_repo_file_diffs(since, until, repo_path=None):
+    """按 merge commit 一次性收集仓库中各文件的 diff。"""
+    merge_commits = parse_merge_commits(since, until, repo_path)
+    diff_chunks = defaultdict(list)
+
+    for merge_hash, _commit_msg in merge_commits:
+        diff_text = run_cmd(
+            f'git diff --find-renames {merge_hash}^ {merge_hash} --',
             cwd=repo_path
-        ).split("\n")
-        
-        for f in files:
-            f = f.strip()
-            if f:
-                changed.add(f)
+        )
+        if not diff_text:
+            continue
 
-    if not changed:
-        return [], [], [], []
+        for file_path, patch in split_diff_by_file(diff_text).items():
+            if patch:
+                diff_chunks[file_path].append(patch)
 
-    def file_exists(path, base_path):
-        if base_path:
-            return os.path.exists(os.path.join(base_path, path))
-        return os.path.exists(path)
+    return {file_path: "\n\n".join(chunks) for file_path, chunks in diff_chunks.items()}, merge_commits
 
+
+def file_exists(path, base_path):
+    if base_path:
+        return os.path.exists(os.path.join(base_path, path))
+    return os.path.exists(path)
+
+
+def classify_changed_files(file_diffs, repo_path=None):
+    changed = sorted(file_diffs.keys())
     java_files = sorted([f for f in changed if f.endswith(".java") and file_exists(f, repo_path) and not is_be_ignored_file(f)])
     frontend_files = sorted([
         f for f in changed
@@ -306,34 +351,54 @@ def get_changed_files(since, until, repo_path=None):
         and not f.endswith((".min.js", ".min.css"))
     ])
     sql_files = sorted([f for f in changed if is_sql_migration_file(f) and file_exists(f, repo_path)])
+    return java_files, frontend_files, sql_files
 
-    return java_files, frontend_files, sql_files, valid_commit_msgs
+
+def read_repo_text_file(file_path, repo_path=None, cache=None):
+    cache = cache if cache is not None else {}
+    if file_path in cache:
+        return cache[file_path]
+
+    full_path = os.path.join(repo_path, file_path) if repo_path else file_path
+    with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+
+    cache[file_path] = content
+    return content
 
 
-def get_file_diff(file_path, since, until, repo_path=None):
-    """获取文件在时间段内的累计 diff"""
-    commits = run_cmd(
-        f'git log --after="{since} 00:00:00" --before="{until} 23:59:59" '
-        f'--no-merges --format="%H" -- "{file_path}"',
-        cwd=repo_path
-    ).split("\n")
-    commits = [c.strip() for c in commits if c.strip()]
+def build_sql_evidence_matcher():
+    sql_keywords = [
+        "create table",
+        "alter table",
+        "drop table",
+        "add column",
+        "drop column",
+        "modify column",
+        "change column",
+        "rename column",
+        "create index",
+        "drop index",
+        "constraint",
+        "comment",
+        "insert into",
+        "update ",
+        "delete from",
+    ]
 
-    if not commits:
-        return ""
-    if len(commits) == 1:
-        return run_cmd(f'git show {commits[0]} -- "{file_path}"', cwd=repo_path)
+    def matcher(line):
+        if not is_changed_diff_line(line):
+            return False
+        lowered = line[1:].strip().lower()
+        return any(keyword in lowered for keyword in sql_keywords)
 
-    oldest, newest = commits[-1], commits[0]
-    parent = run_cmd(f'git rev-parse {oldest}^', cwd=repo_path)
-    if parent:
-        return run_cmd(f'git diff {parent} {newest} -- "{file_path}"', cwd=repo_path)
-    return run_cmd(f'git show {newest} -- "{file_path}"', cwd=repo_path)
+    return matcher
 
 
 def analyze_repo(repo_name, repo_path, since, until):
     """分析单个仓库，返回变更信息"""
-    java_files, frontend_files, sql_files, commit_msgs = get_changed_files(since, until, repo_path)
+    file_diffs, merge_commits = collect_repo_file_diffs(since, until, repo_path)
+    java_files, frontend_files, sql_files = classify_changed_files(file_diffs, repo_path)
     
     return {
         "name": repo_name,
@@ -341,7 +406,8 @@ def analyze_repo(repo_name, repo_path, since, until):
         "java_files": java_files,
         "frontend_files": frontend_files,
         "sql_files": sql_files,
-        "commit_msgs": commit_msgs,
+        "file_diffs": file_diffs,
+        "commit_msgs": [f"{merge_hash} {commit_msg}" for merge_hash, commit_msg in merge_commits],
         "topics": extract_topic_candidates(java_files + frontend_files + sql_files),
     }
 
@@ -352,6 +418,7 @@ def main():
     parser.add_argument("--until", default=None)
     parser.add_argument("--repo-path", default=None, help="单个仓库路径，或包含多个子仓库的项目目录")
     parser.add_argument("--repos", default=None, help="多仓库，格式: name:path,name:path")
+    parser.add_argument("--compact", action="store_true", help="输出关键证据片段，减少大段 raw diff")
     args = parser.parse_args()
 
     since = args.since
@@ -383,15 +450,18 @@ def main():
 
     for result in all_results:
         repo_path = result["path"]
+        file_diffs = result.get("file_diffs", {})
         
         if result["java_files"]:
             entry_files = []
             other_files = []
+            java_content_cache = {}
             for f in result["java_files"]:
-                if is_entry_file(f, repo_path):
-                    entry_files.append(f)
+                content = read_repo_text_file(f, repo_path, java_content_cache)
+                if is_entry_file(f, repo_path, content=content):
+                    entry_files.append((f, content))
                 else:
-                    other_files.append(f)
+                    other_files.append((f, content))
 
             print(f"\n\n{'#'*60}")
             print(f"# 后端变更 [{result['name']}]（入口层 {len(entry_files)} 个，中间层 {len(other_files)} 个）")
@@ -399,9 +469,9 @@ def main():
             if result["topics"]:
                 print(f"# 产品主题候选：{', '.join(result['topics'][:10])}")
 
-            for f in entry_files + other_files:
-                diff = get_file_diff(f, since, until, repo_path)
-                print(format_java_file(f, diff, repo_path))
+            for f, content in entry_files + other_files:
+                diff = file_diffs.get(f, "")
+                print(format_java_file(f, diff, repo_path, content=content, compact=args.compact))
 
         if result["sql_files"]:
             print(f"\n\n{'#'*60}")
@@ -409,14 +479,17 @@ def main():
             print(f"{'#'*60}")
 
             for f in result["sql_files"]:
-                diff = get_file_diff(f, since, until, repo_path)
+                diff = file_diffs.get(f, "")
                 lines = []
                 lines.append(f"\n{'='*60}")
                 lines.append(f"[数据库] {f}")
                 lines.append(f"{'='*60}")
                 lines.append(f"\n▶ SQL 迁移文件（数据库表结构/数据变更）")
-                lines.append(f"\n[Diff]")
-                lines.append(diff if diff else "（无法获取 diff）")
+                evidence = diff
+                if args.compact and diff:
+                    evidence = build_compact_evidence(diff, build_sql_evidence_matcher())
+                lines.append(f"\n[{'关键证据' if args.compact else 'Diff'}]")
+                lines.append(evidence if evidence else "（无法获取 diff）")
                 print("\n".join(lines))
 
         if result["frontend_files"]:
@@ -431,8 +504,8 @@ def main():
                 print(f"# 产品主题候选：{', '.join(result['topics'][:10])}")
 
             for f in router_files + page_files + other_fe:
-                diff = get_file_diff(f, since, until, repo_path)
-                print(format_frontend_file(f, diff))
+                diff = file_diffs.get(f, "")
+                print(format_frontend_file(f, diff, compact=args.compact))
 
 if __name__ == "__main__":
     main()

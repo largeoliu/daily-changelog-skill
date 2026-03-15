@@ -38,14 +38,16 @@ description: 自动化分析代码变更，生成中文产品更新日志。
 ```bash
 python3 scripts/context_fetcher.py \
   --since $SINCE --until $UNTIL \
-  --repo-path /path/to/project-root > /tmp/changelog_report.txt
+  --repo-path /path/to/project-root \
+  --compact > /tmp/changelog_report.txt
 ```
 
 **显式多仓库模式**（当用户明确提供多个路径时）：
 ```bash
 python3 scripts/context_fetcher.py \
   --since $SINCE --until $UNTIL \
-  --repos "backend:/path/to/backend,frontend:/path/to/frontend" > /tmp/changelog_report.txt
+  --repos "backend:/path/to/backend,frontend:/path/to/frontend" \
+  --compact > /tmp/changelog_report.txt
 ```
 
 输出 `NO_CHANGES` 则终止；输出 `REPO_DISCOVERY_ERROR` 则说明路径范围无法解析。
@@ -53,6 +55,10 @@ python3 scripts/context_fetcher.py \
 ### Step 2：读报告
 
 分析输出只保留后端 / 前端 / 数据库的具体变更内容，不需要阅读任何总览统计。
+
+- 优先使用 `--compact`，让脚本输出“产品信号 + 关键证据片段”
+- `关键证据` 是从 raw diff 中抽取的高价值 hunk，不是完整文件 diff
+- 只有在你确实需要深挖某个文件时，才回退到非 compact 模式看完整 diff
 
 **重点阅读**（按优先级）：
 
@@ -95,6 +101,9 @@ python3 scripts/context_fetcher.py \
 1. **日期规则**：
    - 如果某天没有任何实质产品变更内容，则**整一天不输出**
    - 不要为了凑数而输出空洞的日期
+   - 每个二级标题必须严格是**单日**：`## YYYY-MM-DD`
+   - **禁止**输出 `## 2025-03-10 ~ 2025-03-12` 这类日期区间标题
+   - 即使连续几天内容高度相似，也必须拆成各自独立的日期块
 
 2. **分类规则**：
    - 如果某分类（如"技术改造"）没有内容，**该分类整块不输出**
@@ -107,10 +116,11 @@ python3 scripts/context_fetcher.py \
    - 不要写"后端新增 X 个功能提交"这种无意义的内容
    - 优先把同一主题的前后端、SQL、DTO、页面改动归并成一条
    - 如果只能确认到能力层，写“支持按...查看...”或“新增...能力”，不要写技术实现名
-   - 禁止在最终日志中出现文件路径、文件名、类名、方法名、组件名
-   - 像 `ExamplePage.tsx`、`ExampleController`、`ExampleQueryService` 这类技术名只能作为分析证据，不能直接写进结果
-   - 像“参数错误码”“系统异常”“DTO 字段”这类研发术语，要翻译成用户能理解的话
-   - 如果找不到场景锚点，不要强行输出正式产品日志，可降级为“后台某能力优化（具体入口待确认）”
+    - 禁止在最终日志中出现文件路径、文件名、类名、方法名、组件名
+    - 像 `ExamplePage.tsx`、`ExampleController`、`ExampleQueryService` 这类技术名只能作为分析证据，不能直接写进结果
+    - 像“参数错误码”“系统异常”“DTO 字段”这类研发术语，要翻译成用户能理解的话
+    - 如果找不到场景锚点，不要强行输出正式产品日志，可降级为“后台某能力优化（具体入口待确认）”
+    - 如果某条内容仍含有技术词，先**改写**成产品语言；如果仍无法去技术化，再**降级**成更抽象的业务描述；只有在完全无法判断产品含义时才删除
 
 4. **禁止事项**：
     - 不要使用 `generate_yearly_changelog.py`
@@ -157,14 +167,37 @@ python3 scripts/context_fetcher.py \
 - ExampleQueryService.java
 ```
 
+```markdown
+## 2025-03-10 ~ 2025-03-12
+
+### ✨ 新功能
+
+- 连续几天的内容被合并成一个日期区间
+```
+
+```markdown
+- 订单管理相关功能优化：PrivateSphereOrderStatisticsV2Dto。
+- 供应商管理能力增强，优化了 supplier / accounts、supplier / order-filter-options / {type} 相关流程。
+- 前端交互体验优化：app.tsx、index.tsx 页面结构或操作入口可能变化。
+```
+
 ---
 
 ### Step 5：保存
 
-将生成的日志保存到用户指定的位置，文件中保留标题和更新日志正文。
+先将生成的日志写入临时文件，再校验结构；校验通过后再保存到用户指定的位置，文件中保留标题和更新日志正文。
 
 如果用户要求“按天输出并汇总成一个文件”：
 
 - 按日期逐天执行 Step 1 ~ Step 4
 - 某天输出 `NO_CHANGES` 则整天跳过
 - 将有内容的日期块按用户要求顺序汇总到同一个文件
+- 汇总后运行校验脚本，确保没有日期区间标题：
+
+```bash
+python3 scripts/changelog_guard.py --file /tmp/final_changelog.md --order $ORDER --check-tech
+```
+
+- `$ORDER` 取值：`desc`、`asc`、`any`
+- 如果校验失败，**不要保存无效结果**；必须回到对应日期块重新生成或重写对应条目，直到校验通过
+- 对技术词问题，优先按“重写 -> 降级 -> 最后才删除”的顺序处理，尽量保留真实的产品变更信息
