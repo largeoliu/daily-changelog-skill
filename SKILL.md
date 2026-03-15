@@ -59,6 +59,7 @@ python3 scripts/context_fetcher.py \
 - 优先使用 `--compact`，让脚本输出“产品信号 + 关键证据片段”
 - `关键证据` 是从 raw diff 中抽取的高价值 hunk，不是完整文件 diff
 - 只有在你确实需要深挖某个文件时，才回退到非 compact 模式看完整 diff
+- 不要把 commit message 当作主要依据；它可能失真，结论必须以实际代码 diff 和文件上下文为准
 
 **重点阅读**（按优先级）：
 
