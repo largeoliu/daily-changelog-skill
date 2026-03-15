@@ -29,6 +29,13 @@
 - 分类：`✨ 新功能`、`🔄 功能变更`、`🔧 技术改造`、`🐛 Bug 修复`
 - 规则：空日期不输出，空分类不输出
 
+## 路径处理
+
+- 可以传单个 git 仓库路径
+- 也可以传项目总目录或父目录
+- 如果输入路径本身不是 git 仓库，脚本会自动发现子目录中的 git 仓库并切换到多仓库分析模式
+- 只有在你明确想指定仓库集合时，才需要手动传 `--repos`
+
 ## 核心约束
 
 - 最终结果必须写成产品语言，而不是研发语言
@@ -51,7 +58,7 @@
 
 ```bash
 python3 scripts/context_fetcher.py --help
-python3 scripts/context_fetcher.py --since 2026-03-01 --until 2026-03-07 --repo-path /path/to/repo
+python3 scripts/context_fetcher.py --since 2026-03-01 --until 2026-03-07 --repo-path /path/to/project-root
 python3 scripts/context_fetcher.py --since 2026-03-01 --repos "backend:/path/to/backend,frontend:/path/to/frontend"
 ```
 

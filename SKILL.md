@@ -5,36 +5,50 @@ description: 自动化分析代码变更，生成中文产品更新日志。
 
 # 全栈产品更新日志生成器
 
-## 参数
+## 输入语义
 
-| 参数 | 行为 |
+| 用户输入 | Skill 应如何理解 |
 |------|------|
-| 无参数 | 分析今天 |
+| 未提供日期 | 默认分析今天 |
 | `YYYY-MM-DD` | 分析指定日期 |
 | `YYYY-MM-DD YYYY-MM-DD` | 分析日期区间 |
-| `--repos` | 多仓库分析，格式: `name:path,name:path` |
+| 项目路径 / 项目目录 | 优先作为 `--repo-path` 处理，可为单仓库或聚合目录 |
+| 明确给出多个独立仓库路径 | 使用 `--repos` 进行显式多仓库分析 |
+| “每天” / “逐天” | 按天执行分析，再汇总成一个结果 |
+| “按时间倒序” / “按时间正序” | 只影响最终汇总输出顺序，不改变分析逻辑 |
+| “保存到 /path/to/file.md” | 将最终结果写入用户指定文件 |
 
 ---
 
 ## 执行流程
 
+### Step 0：解析目标路径
+
+- 用户给的路径可能是：单个 git 仓库、项目总目录、父目录、多个子仓库的聚合目录
+- **不要因为目标路径本身没有 `.git` 就立刻失败**
+- 优先使用 `--repo-path /path/to/target`，让脚本自行判断：
+  - 如果该路径本身是 git 仓库，直接按单仓库分析
+  - 如果该路径不是 git 仓库，则自动发现其子目录中的一个或多个 git 仓库
+- 只有在用户明确给出多个独立路径，或自动发现结果不符合预期时，再手动使用 `--repos`
+- 如果脚本输出 `REPO_DISCOVERY_ERROR`，说明路径下没有发现可分析仓库，此时再向用户说明原因
+
 ### Step 1：运行分析脚本
 
-**单仓库模式**：
+**单路径模式**（推荐起点，支持自动发现子仓库）：
 ```bash
 python3 scripts/context_fetcher.py \
   --since $SINCE --until $UNTIL \
-  --repo-path /path/to/repo > /tmp/changelog_report.txt
+  --repo-path /path/to/project-root > /tmp/changelog_report.txt
 ```
 
-**多仓库模式**（推荐，用于全栈项目）：
+**显式多仓库模式**（当用户明确提供多个路径时）：
 ```bash
 python3 scripts/context_fetcher.py \
   --since $SINCE --until $UNTIL \
   --repos "backend:/path/to/backend,frontend:/path/to/frontend" > /tmp/changelog_report.txt
 ```
 
-输出 `NO_CHANGES` 则终止。
+输出 `NO_CHANGES` 则终止；输出 `REPO_DISCOVERY_ERROR` 则说明路径范围无法解析。
 
 ### Step 2：读报告
 
@@ -148,3 +162,9 @@ python3 scripts/context_fetcher.py \
 ### Step 5：保存
 
 将生成的日志保存到用户指定的位置。
+
+如果用户要求“按天输出并汇总成一个文件”：
+
+- 按日期逐天执行 Step 1 ~ Step 4
+- 某天输出 `NO_CHANGES` 则整天跳过
+- 将有内容的日期块按用户要求顺序汇总到同一个文件

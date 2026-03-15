@@ -12,13 +12,20 @@
   python3 context_fetcher.py                              # 今天
   python3 context_fetcher.py --since 2025-03-10           # 指定日期
   python3 context_fetcher.py --since 2025-03-01 --until 2025-03-12
+  python3 context_fetcher.py --repo-path /path/to/project-root
   python3 context_fetcher.py --repos "backend:/path/to/backend,frontend:/path/to/frontend"
+
+说明：
+  - --repo-path 可以传单个 git 仓库，也可以传包含多个子仓库的项目目录
+  - 当输入路径本身不是 git 仓库时，脚本会自动发现子目录中的 git 仓库
 """
 
 import subprocess
 import os
 import re
 import argparse
+import shlex
+import sys
 from datetime import datetime
 
 from backend_analyzer import format_java_file, is_entry_file, is_ignored_file as is_be_ignored_file, is_sql_migration_file
@@ -32,6 +39,20 @@ TOPIC_STOP_WORDS = {
     "protected", "static", "application", "resource"
 }
 
+DISCOVERY_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "coverage",
+}
+
 
 def run_cmd(cmd, cwd=None):
     try:
@@ -40,6 +61,151 @@ def run_cmd(cmd, cwd=None):
         ).decode("utf-8").strip()
     except subprocess.CalledProcessError:
         return ""
+
+
+def resolve_git_root(path):
+    """返回路径所在 git 仓库的根目录；若不是 git 仓库则返回空字符串。"""
+    if not path:
+        return ""
+    abs_path = os.path.abspath(path)
+    if not os.path.exists(abs_path):
+        return ""
+    quoted = shlex.quote(abs_path)
+    root = run_cmd(f"git -C {quoted} rev-parse --show-toplevel")
+    if not root:
+        return ""
+    return os.path.abspath(root)
+
+
+def sanitize_repo_name(name, used_names):
+    base = re.sub(r"[^A-Za-z0-9]+", "-", (name or "repo").strip()).strip("-").lower() or "repo"
+    candidate = base
+    index = 2
+    while candidate in used_names:
+        candidate = f"{base}-{index}"
+        index += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def discover_git_repos(path, max_depth=2):
+    """从给定路径自动发现 git 仓库。
+
+    优先将输入路径本身识别为仓库；若不是仓库，则递归扫描子目录。
+    """
+    target = os.path.abspath(path)
+    if not os.path.exists(target):
+        return [], "missing"
+
+    direct_root = resolve_git_root(target)
+    if direct_root:
+        return [(os.path.basename(direct_root), direct_root)], "direct"
+
+    discovered = []
+    seen_paths = set()
+    for current_root, dirnames, _ in os.walk(target):
+        rel_path = os.path.relpath(current_root, target)
+        depth = 0 if rel_path == "." else rel_path.count(os.sep) + 1
+
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in DISCOVERY_SKIP_DIRS and not d.startswith(".")
+        ]
+
+        if depth > max_depth:
+            dirnames[:] = []
+            continue
+
+        if current_root == target:
+            continue
+
+        repo_root = resolve_git_root(current_root)
+        if not repo_root:
+            continue
+
+        repo_root = os.path.abspath(repo_root)
+        try:
+            if os.path.commonpath([target, repo_root]) != target:
+                continue
+        except ValueError:
+            continue
+
+        if repo_root in seen_paths:
+            dirnames[:] = []
+            continue
+
+        seen_paths.add(repo_root)
+        discovered.append((os.path.basename(repo_root), repo_root))
+        dirnames[:] = []
+
+    return sorted(discovered, key=lambda item: item[1]), "discovered"
+
+
+def expand_repo_target(name, path, used_names):
+    """把用户提供的路径展开成一个或多个 git 仓库。"""
+    repo_name = name.strip() if name else ""
+    repos, mode = discover_git_repos(path)
+    if not repos:
+        return [], mode, f"未在路径下发现 Git 仓库：{os.path.abspath(path)}"
+
+    expanded = []
+    if len(repos) == 1:
+        final_name = sanitize_repo_name(repo_name or repos[0][0], used_names)
+        expanded.append((final_name, repos[0][1]))
+        return expanded, mode, ""
+
+    for discovered_name, repo_path in repos:
+        base_name = f"{repo_name}-{discovered_name}" if repo_name else discovered_name
+        expanded.append((sanitize_repo_name(base_name, used_names), repo_path))
+    return expanded, mode, ""
+
+
+def resolve_repo_inputs(args):
+    """解析命令行中的仓库输入，支持单仓库、项目目录和显式多仓库。"""
+    notices = []
+    errors = []
+    repos = []
+    used_names = set()
+
+    if args.repos:
+        for item in args.repos.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" not in item:
+                errors.append(f"仓库参数格式错误：{item}")
+                continue
+            raw_name, raw_path = item.split(":", 1)
+            expanded, mode, error = expand_repo_target(raw_name, raw_path.strip(), used_names)
+            if error:
+                errors.append(error)
+                continue
+            repos.extend(expanded)
+            if mode == "discovered":
+                notices.append(
+                    f"# 仓库发现：{os.path.abspath(raw_path.strip())} 不是 Git 仓库，已自动识别 {len(expanded)} 个子仓库"
+                )
+    else:
+        raw_path = args.repo_path or "."
+        expanded, mode, error = expand_repo_target("", raw_path, used_names)
+        if error:
+            errors.append(error)
+        else:
+            repos.extend(expanded)
+            if mode == "discovered":
+                notices.append(
+                    f"# 仓库发现：{os.path.abspath(raw_path)} 不是 Git 仓库，已自动识别 {len(expanded)} 个子仓库"
+                )
+
+    deduped = []
+    seen_paths = set()
+    for repo_name, repo_path in repos:
+        if repo_path in seen_paths:
+            continue
+        seen_paths.add(repo_path)
+        deduped.append((repo_name, repo_path))
+
+    return deduped, notices, errors
 
 
 def classify_change_type(commit_msgs):
@@ -208,29 +374,27 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--since", default=datetime.today().strftime("%Y-%m-%d"))
     parser.add_argument("--until", default=None)
-    parser.add_argument("--repo-path", default=None, help="单个仓库路径")
+    parser.add_argument("--repo-path", default=None, help="单个仓库路径，或包含多个子仓库的项目目录")
     parser.add_argument("--repos", default=None, help="多仓库，格式: name:path,name:path")
     args = parser.parse_args()
 
     since = args.since
     until = args.until or since
 
-    # 解析仓库列表
-    repos = []
-    if args.repos:
-        for item in args.repos.split(","):
-            if ":" in item:
-                name, path = item.split(":", 1)
-                repos.append((name.strip(), path.strip()))
-    elif args.repo_path:
-        repos = [("default", args.repo_path)]
-    else:
-        repos = [("default", ".")]
+    repos, notices, errors = resolve_repo_inputs(args)
+
+    if errors:
+        print("REPO_DISCOVERY_ERROR")
+        for message in errors:
+            print(f"# {message}")
+        sys.exit(2)
 
     print(f"# 变更分析报告")
     print(f"# 分析范围：{since} ~ {until}")
     print(f"# 统计模式：按合并到主分支的时间")
     print(f"# 分析仓库数：{len(repos)}")
+    for notice in notices:
+        print(notice)
     
     all_results = []
     total_java = 0
