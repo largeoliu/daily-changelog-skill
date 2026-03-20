@@ -389,7 +389,10 @@ NOISE_TITLE_PATTERNS = [
 LOW_QUALITY_TITLE_PATTERNS = [
     r"^(请输入|请选择|请至少|请使用|暂无|暂未|缺少).+",
     r"^请先.+",
+    r"^点击下方.+",
+    r"^在.+中.+",
     r"^是否.+[？?]$",
+    r"^加载.+",
     r"^已发起.+",
     r"^已复制.+",
     r"^周[一二三四五六日天]$",
@@ -405,6 +408,39 @@ LOW_QUALITY_TITLE_PATTERNS = [
     r"^未加好友.+",
     r"^1分钟内不能再次签退哦$",
     r"^查询数据失败$",
+    r"^欢迎来到.+",
+    r"^.+(?:还|还|未)没有.+",
+    r"^.+(?:还|未)未配置.+",
+    r"^该.+还?没有?.+",
+    r"^请确认.+后再提交",
+    r"^请.+后再.+",
+    r"^.+(?:暂时|暂)不.+",
+    r"^.+(?:请|请先)联系.+",
+    r"^.+请在.+分钟内.+",
+    r"^.+(?:不支持|不支持).+类型",
+    r"^导入失败.+",
+    r"^.+(?:必须|需要).+小于.+(?:MB|GB)",
+    r"^二维码失效$",
+    r"^固定时间名称$",
+    r"^选择加密类型$",
+    r"^文件大小必须.+",
+    r"^.+(?:成功|失败|错误|异常).+(?:已|已更|已更新|已生效)$",
+    r"^.+(?:菜单|导航|按钮)$",
+    r"^查看.+菜单$",
+    r"^.+(?:设置|配置)菜单$",
+    r"^导入成功.+",
+    r"^目标导入成功$",
+    r"^.+(?:已|已经)更新$",
+    r"^导入.+失败$",
+    r"^.+(?:导入|上报|提交).+失败$",
+    r"^.+(?:失败|错误|异常)[a-zA-Z]*$",
+    r"^.+不能为空$",
+    r"^.+未初始化$",
+    r"^.+初始化$",
+    r"^.+时间:$",
+    r"^.+时间：$",
+    r"^新增.+新增$",
+    r"^.{30,}$",
 ]
 
 GENERIC_FILTER_LABELS = {
@@ -566,6 +602,7 @@ def collect_repo_file_diffs_by_day(since, until, repo_path=None):
             commit_date,
             {
                 "diff_chunks": defaultdict(list),
+                "file_commits": defaultdict(list),
                 "file_meta": {},
                 "commit_msgs": [],
                 "commit_count": 0,
@@ -578,6 +615,7 @@ def collect_repo_file_diffs_by_day(since, until, repo_path=None):
             if not patch:
                 continue
             bucket["diff_chunks"][file_path].append(patch)
+            bucket["file_commits"][file_path].append(f"{commit_hash} {commit['subject']}")
             bucket["file_meta"][file_path] = {
                 "fallback_ref": first_parent,
                 "last_commit": commit_hash,
@@ -593,6 +631,10 @@ def collect_repo_file_diffs_by_day(since, until, repo_path=None):
         java_files, frontend_files, sql_files = classify_changed_files(file_diffs, repo_path)
         day_results[commit_date] = {
             "file_diffs": file_diffs,
+            "file_commits": {
+                file_path: dedupe_keep_order(messages)
+                for file_path, messages in payload["file_commits"].items()
+            },
             "file_meta": payload["file_meta"],
             "main_ref": main_ref,
             "commit_msgs": payload["commit_msgs"],
@@ -688,6 +730,17 @@ def humanize_theme_name(value):
 
 def contains_cjk(text):
     return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def has_meaningful_cjk_title(text):
+    value = str(text or "").strip()
+    if not value or not contains_cjk(value):
+        return False
+    stripped = value
+    generic_terms = sorted(set(CJK_THEME_STOP_WORDS) | set(ANCHOR_HINT_WORDS) | {"接口"}, key=len, reverse=True)
+    for term in generic_terms:
+        stripped = stripped.replace(term, " ")
+    return bool(re.search(r"[\u4e00-\u9fff]{2,}", stripped))
 
 
 def extract_cjk_terms(text):
@@ -798,7 +851,12 @@ def score_title_candidate(value):
         return -1000
     if is_low_quality_title(text):
         return -500
+    meaningful = contains_cjk(text) and has_meaningful_cjk_title(text)
+    if not meaningful:
+        return -300
     if contains_cjk(text):
+        if not has_meaningful_cjk_title(text):
+            return -300
         score = 100
         if has_strong_product_term([text]):
             score += 20
@@ -914,12 +972,75 @@ def has_visual_signals(values):
 
 def has_detail_signals(values):
     joined = " ".join([str(value or "") for value in values or []])
-    return bool(re.search(r"(详情|明细|展示|时间线|列表|趋势|字段|点位列表|获客明细|作业路线)", joined, re.IGNORECASE))
+    return bool(re.search(r"(详情|明细|展示|时间线|列表|趋势|字段)", joined, re.IGNORECASE))
 
 
 def has_bugfix_signals(values):
     joined = " ".join([str(value or "") for value in values or []])
-    return bool(re.search(r"(修复|bug|异常|错误|失败|偏移)", joined, re.IGNORECASE))
+    return bool(re.search(r"(修复|bug|异常|错误|失败|偏移|问题|缺陷|修复|fix)", joined, re.IGNORECASE))
+
+
+def has_tech_signals(values):
+    joined = " ".join([str(value or "") for value in values or []])
+    return bool(re.search(r"(优化|重构|性能|效率|提升|改造|技术改进|refactor)", joined, re.IGNORECASE))
+
+
+def has_menu_signals(values):
+    joined = " ".join([str(value or "") for value in values or []])
+    return bool(re.search(r"(菜单|导航|侧边栏|sidebar|menu|nav|路由|path)", joined, re.IGNORECASE))
+
+
+def has_button_signals(values):
+    joined = " ".join([str(value or "") for value in values or []])
+    return bool(re.search(r"(按钮|button|点击|click|提交|保存|导出|删除|编辑|新增|添加|确认|取消|重置)", joined, re.IGNORECASE))
+
+
+def infer_feature_slot_from_structure(routes=None, scene_anchor=None, file_path=None):
+    routes = routes or []
+    scene_anchor = scene_anchor or ""
+    file_path = file_path or ""
+    joined_routes = " ".join(str(r or "") for r in routes).lower()
+
+    if re.search(r"(list|query|search|filter)", joined_routes):
+        return "query_filter"
+    if re.search(r"(detail|info|view)", joined_routes):
+        return "detail_display"
+    if re.search(r"(stat|chart|analysis|board)", joined_routes):
+        return "visual_ux"
+    if re.search(r"(create|add|new)", joined_routes):
+        return "page_launch"
+    if re.search(r"(menu|navigation|nav|sidebar)", joined_routes):
+        return "menu_launch"
+    if routes:
+        return "launch_support"
+    return "support_only"
+
+
+def infer_frontend_feature_slots(role_counts=None, has_route=False, has_page_entry=False):
+    role_counts = role_counts or {}
+    subview_count = role_counts.get("页面子视图", 0)
+    support_count = role_counts.get("页面支撑组件", 0)
+    data_count = role_counts.get("页面数据层", 0)
+    state_count = role_counts.get("页面状态层", 0)
+    config_count = role_counts.get("页面配置层", 0)
+    tool_count = role_counts.get("页面工具层", 0)
+    total = sum(role_counts.values())
+
+    if has_route:
+        return ["page_launch"]
+    if not has_page_entry:
+        return ["support_only"]
+
+    slots = []
+    if subview_count > 0 or data_count > 0:
+        slots.append("detail_display")
+    if support_count > 0 or state_count > 0 or config_count > 0:
+        slots.append("query_filter")
+    if tool_count > 0 or (support_count > 0 and subview_count == 0):
+        slots.append("visual_ux")
+    if not slots:
+        slots.append("feature_flow")
+    return slots
 
 
 def infer_feature_slot(values, has_route=False, launch_support=False, support_only=False):
@@ -934,17 +1055,23 @@ def infer_feature_slot(values, has_route=False, launch_support=False, support_on
         return "support_only"
     if has_bugfix_signals(values):
         return "bugfix"
+    if has_tech_signals(values):
+        return "tech_improvement"
+    if has_button_signals(values):
+        return "button_action"
     if has_query_signals(values):
         return "query_filter"
     if has_visual_signals(values):
         return "visual_ux"
     if has_detail_signals(values):
         return "detail_display"
+    if has_menu_signals(values):
+        return "menu_launch"
     if launch_support:
         return "launch_support"
     if has_route:
         return "page_launch"
-    if re.search(r"(统计|分析|看板|绩效|获客)", joined):
+    if re.search(r"(统计|分析|看板|绩效)", joined):
         return "feature_flow"
     return "feature_flow"
 
@@ -1209,6 +1336,7 @@ def make_theme_candidate(
     repo_name="",
     repo_path="",
     role_summary="",
+    title_source_tier="unknown",
 ):
     routes = dedupe_keep_order(routes or [])
     paths = dedupe_keep_order(paths or [])
@@ -1236,19 +1364,20 @@ def make_theme_candidate(
         "repo_name": repo_name,
         "repo_path": repo_path,
         "role_summary": role_summary,
+        "title_source_tier": title_source_tier,
     }
 
 
-def is_generic_backend_candidate(domain, title, labels, routes):
+def is_generic_backend_candidate(routes=None, file_path=None):
+    routes = routes or []
+    file_path = file_path or ""
     if not routes:
         return True
-    if not domain or not domain.get("key"):
-        return True
-    if any(re.search(pattern, title or "") for pattern in GENERIC_BACKEND_LABEL_PATTERNS):
-        return True
-    if not has_strong_product_term([domain.get("title"), title] + labels):
-        return True
-    return False
+    if any(re.search(r"(list|query|search|filter|stat|detail|create|add|menu|nav)", str(r or "").lower()) for r in routes):
+        return False
+    if re.search(r"(controller|service|dto|vo|bo|dao|repository|config|util|common|exception)", file_path, re.IGNORECASE):
+        return False
+    return True
 
 
 def build_backend_theme_candidates(result):
@@ -1288,8 +1417,7 @@ def build_backend_theme_candidates(result):
             labels=labels,
             titles=[raw_title, inspection.get("scene_anchor")],
         )
-        support_only = is_generic_backend_candidate(domain, raw_title, labels, routes)
-        feature_values = [raw_title, inspection.get("scene_anchor")] + labels + routes
+        support_only = is_generic_backend_candidate(routes=routes, file_path=file_path)
         feature_slot = "support_only" if support_only else "launch_support"
         candidates.append(
             make_theme_candidate(
@@ -1304,6 +1432,7 @@ def build_backend_theme_candidates(result):
                 source_refs=[file_path],
                 repo_name=result["name"],
                 repo_path=repo_path,
+                title_source_tier="structural",
             )
         )
 
@@ -1320,6 +1449,7 @@ def build_frontend_theme_candidates(result):
             key,
             {
                 "page_root": page_root,
+                "route_files": [],
                 "titles": [],
                 "paths": [],
                 "labels": [],
@@ -1370,6 +1500,8 @@ def build_frontend_theme_candidates(result):
                 continue
             group = ensure_group(group_key, page_root=component_root or route_root)
             group["has_route"] = True
+            if file_path not in group["route_files"]:
+                group["route_files"].append(file_path)
             if entry.get("title"):
                 group["titles"].append(entry["title"])
             if entry.get("name"):
@@ -1380,23 +1512,24 @@ def build_frontend_theme_candidates(result):
 
     candidates = []
     for _, group in groups.items():
-        labels = cleaned_title_candidates(group["labels"])
+        labels = [l for l in cleaned_title_candidates(group["labels"]) if score_title_candidate(l) >= 100]
         filters = cleaned_title_candidates(group["filters"])
         columns = cleaned_title_candidates(group["columns"])
-        titles = cleaned_title_candidates(group["titles"])
+        page_path_title = humanize_theme_name(group["page_root"])
+        titles = cleaned_title_candidates(group["titles"]) + [page_path_title]
         domain = detect_domain(
             routes=group["paths"],
             paths=[group["page_root"]] + group["files"],
             labels=labels + filters + columns,
-            titles=titles + [humanize_theme_name(group["page_root"])],
+            titles=titles,
         )
         if not domain:
             continue
 
-        feature_values = [domain.get("title")] + titles + labels + filters + columns + group["paths"]
-        source_refs = dedupe_keep_order(group["files"])
+        source_refs = dedupe_keep_order((group.get("route_files") or []) + group["files"])
         role_summary = summarize_role_counts(group["role_counts"])
 
+        title_tier = "structural" if (group["has_route"] or group["has_page_entry"]) else "text"
         if group["has_route"]:
             candidates.append(
                 make_theme_candidate(
@@ -1413,20 +1546,15 @@ def build_frontend_theme_candidates(result):
                     repo_name=result["name"],
                     repo_path=result["path"],
                     role_summary=role_summary,
+                    title_source_tier=title_tier,
                 )
             )
 
-        visible_slots = []
-        if group["has_route"] or group["has_page_entry"]:
-            if has_query_signals(feature_values):
-                visible_slots.append("query_filter")
-            if has_visual_signals(feature_values):
-                visible_slots.append("visual_ux")
-            if has_detail_signals(feature_values):
-                visible_slots.append("detail_display")
-
-        if not visible_slots and group["has_page_entry"] and not group["has_route"] and has_strong_product_term(feature_values):
-            visible_slots.append("feature_flow")
+        visible_slots = infer_frontend_feature_slots(
+            role_counts=group["role_counts"],
+            has_route=group["has_route"],
+            has_page_entry=group["has_page_entry"],
+        )
 
         if visible_slots:
             for slot in dedupe_keep_order(visible_slots):
@@ -1445,6 +1573,7 @@ def build_frontend_theme_candidates(result):
                         repo_name=result["name"],
                         repo_path=result["path"],
                         role_summary=role_summary,
+                        title_source_tier=title_tier,
                     )
                 )
         else:
@@ -1463,6 +1592,7 @@ def build_frontend_theme_candidates(result):
                     repo_name=result["name"],
                     repo_path=result["path"],
                     role_summary=role_summary,
+                    title_source_tier="text",
                 )
             )
 
@@ -1562,6 +1692,7 @@ def analyze_repo_window(repo_name, repo_path, since, until):
             "frontend_files": payload["frontend_files"],
             "sql_files": payload["sql_files"],
             "file_diffs": payload["file_diffs"],
+            "file_commits": payload.get("file_commits", {}),
             "file_meta": payload["file_meta"],
             "commit_msgs": payload["commit_msgs"],
             "commit_count": payload["commit_count"],

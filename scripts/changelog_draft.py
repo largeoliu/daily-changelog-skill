@@ -15,6 +15,7 @@ from context_fetcher import (
     candidate_similarity,
     contains_cjk,
     extract_merge_terms,
+    has_meaningful_cjk_title,
     has_strong_product_term,
     is_generic_theme_title,
     is_low_quality_title,
@@ -123,6 +124,14 @@ def flatten_candidates(day_reports):
     return flattened
 
 
+def choose_best_title_tier(tiers):
+    if "structural" in tiers:
+        return "structural"
+    if "unknown" in tiers:
+        return "unknown"
+    return "text"
+
+
 def create_aggregate(candidate, index):
     feature_slot = candidate.get("feature_slot") or candidate.get("primary_family") or "feature_flow"
     should_publish = bool(candidate.get("user_visible")) and feature_slot not in {"support_only", "launch_support"}
@@ -145,6 +154,7 @@ def create_aggregate(candidate, index):
         "user_visible": bool(candidate.get("user_visible")),
         "support_only": bool(candidate.get("support_only")),
         "should_publish": should_publish,
+        "title_source_tier": candidate.get("title_source_tier", "unknown"),
         "merged_from": [
             {
                 "date": candidate["date"],
@@ -188,6 +198,10 @@ def merge_candidate(theme, candidate):
     theme["user_visible"] = theme["user_visible"] or bool(candidate.get("user_visible"))
     theme["support_only"] = theme["support_only"] and bool(candidate.get("support_only"))
     theme["should_publish"] = theme["user_visible"] and not theme["support_only"]
+    theme["title_source_tier"] = choose_best_title_tier([
+        theme.get("title_source_tier", "unknown"),
+        candidate.get("title_source_tier", "unknown"),
+    ])
     theme["merged_from"].append(
         {
             "date": candidate["date"],
@@ -229,13 +243,16 @@ def merge_theme_candidates(day_reports):
 
 FEATURE_SLOT_PRIORITY = {
     "page_launch": 0,
+    "menu_launch": 0,
+    "button_action": 0,
     "feature_flow": 1,
     "query_filter": 2,
     "detail_display": 3,
     "visual_ux": 4,
     "bugfix": 5,
-    "launch_support": 6,
-    "support_only": 7,
+    "tech_improvement": 6,
+    "launch_support": 7,
+    "support_only": 8,
 }
 
 
@@ -247,12 +264,14 @@ RECORD_KIND_PRIORITY = {
 }
 
 
-TECH_SLOTS = {"launch_support", "support_only"}
+TECH_SLOTS = {"launch_support", "support_only", "tech_improvement"}
 
 
 def slot_record_kind(slot):
-    if slot == "page_launch":
+    if slot in {"page_launch", "menu_launch", "button_action"}:
         return "launch"
+    if slot == "tech_improvement":
+        return "tech"
     if slot == "bugfix":
         return "bugfix"
     if slot in TECH_SLOTS:
@@ -333,6 +352,7 @@ def create_day_record(domain_key, delivery_date, items, record_kind, suppressed_
         "support_only": all(item.get("support_only") for item in items),
         "should_publish": any(item.get("should_publish") for item in items),
         "suppressed_slots": sorted(set(suppressed_slots or [])),
+        "title_source_tier": choose_best_title_tier([item.get("title_source_tier", "unknown") for item in items]),
     }
 
 
@@ -340,14 +360,14 @@ def has_publishable_product_identity(record):
     title = str(record.get("domain_title") or record.get("theme_title") or "").strip()
     if not title or is_generic_theme_title(title) or is_low_quality_title(title):
         return False
-    if contains_cjk(title) and (has_strong_product_term([title]) or any(hint in title for hint in ANCHOR_HINT_WORDS)):
+    if contains_cjk(title) and has_meaningful_cjk_title(title) and (has_strong_product_term([title]) or any(hint in title for hint in ANCHOR_HINT_WORDS)):
         return True
 
     for anchor in record.get("anchor_candidates") or []:
         text = str(anchor or "").strip()
         if not text or not contains_cjk(text):
             continue
-        if has_strong_product_term([text]) or any(hint in text for hint in ANCHOR_HINT_WORDS):
+        if has_meaningful_cjk_title(text) and (has_strong_product_term([text]) or any(hint in text for hint in ANCHOR_HINT_WORDS)):
             return True
     return False
 
@@ -478,7 +498,7 @@ def absorb_low_quality_records_into_launch(records):
                 continue
 
             target = None
-            if launches and is_low_quality_record_title(record):
+            if launches:
                 for launch in launches:
                     if root_domain_key(launch) == root_domain_key(record) or (record_similarity_terms(launch) & record_similarity_terms(record)):
                         target = launch
@@ -515,18 +535,9 @@ def apply_publishability(records):
         for record in domain_records:
             if record.get("should_publish") or record.get("record_kind") != "tech":
                 continue
-            if not has_frontend_support_evidence(record):
-                continue
             if not has_publishable_product_identity(record):
                 continue
-            has_prior_visible_history = any(
-                previous.get("should_publish")
-                and previous.get("record_kind") in {"launch", "enhancement"}
-                and parse_date(previous["delivery_date"]) < parse_date(record["delivery_date"])
-                for previous in domain_records
-            )
-            if has_prior_visible_history:
-                record["should_publish"] = True
+            record["should_publish"] = True
         normalized.extend(domain_records)
     return normalized
 
@@ -582,12 +593,36 @@ def build_domain_day_records(themes, order):
         for delivery_date, day_items in day_groups.items():
             launch_items = [item for item in day_items if slot_record_kind(item.get("feature_slot")) == "launch"]
             if launch_items:
+                all_items_same_domain = []
+                other_items = []
+                for item in day_items:
+                    is_same_domain = False
+                    for launch in launch_items:
+                        if root_domain_key(launch) == root_domain_key(item) or (record_similarity_terms(launch) & record_similarity_terms(item)):
+                            is_same_domain = True
+                            break
+                    if is_same_domain:
+                        all_items_same_domain.append(item)
+                    else:
+                        other_items.append(item)
+
                 suppressed_slots = [
                     item.get("feature_slot")
-                    for item in day_items
+                    for item in all_items_same_domain
                     if item.get("feature_slot") != "page_launch"
                 ]
-                records.append(create_day_record(domain_key, delivery_date, day_items, "launch", suppressed_slots))
+                if all_items_same_domain:
+                    records.append(create_day_record(domain_key, delivery_date, all_items_same_domain, "launch", suppressed_slots))
+
+                grouped_other = {"enhancement": [], "bugfix": [], "tech": []}
+                for item in other_items:
+                    grouped_other.setdefault(slot_record_kind(item.get("feature_slot")), []).append(item)
+
+                for record_kind in ("enhancement", "bugfix", "tech"):
+                    kind_items = grouped_other.get(record_kind) or []
+                    if not kind_items:
+                        continue
+                    records.append(create_day_record(domain_key, delivery_date, kind_items, record_kind))
                 continue
 
             grouped_items = {"enhancement": [], "bugfix": [], "tech": []}
@@ -610,7 +645,7 @@ def build_domain_day_records(themes, order):
     return records
 
 
-def build_day_reports(repos, since, until, window_days=None, active_days=None):
+def build_day_reports(repos, since, until, window_days=None, active_days=None, include_context=False):
     reports = []
     _effective_window_days, windows = resolve_window_plan(since, until, window_days)
     resolved_active_days = list(active_days) if active_days is not None else collect_active_days(repos, since, until)
@@ -644,6 +679,17 @@ def build_day_reports(repos, since, until, window_days=None, active_days=None):
                         "path": result["path"],
                         "main_ref": result["main_ref"],
                         "theme_candidates": candidates,
+                        **(
+                            {
+                                "file_diffs": result.get("file_diffs", {}),
+                                "file_commits": result.get("file_commits", {}),
+                                "file_meta": result.get("file_meta", {}),
+                                "commit_msgs": result.get("commit_msgs", []),
+                                "commit_count": result.get("commit_count", 0),
+                            }
+                            if include_context
+                            else {}
+                        ),
                     }
                 )
             reports.append(day_report)
@@ -657,10 +703,7 @@ def build_repo_fingerprint(repos):
     return digest.hexdigest()
 
 
-def build_ledger_payload(repos, notices, since, until, order, window_days=None):
-    effective_window_days, windows = resolve_window_plan(since, until, window_days)
-    active_days = collect_active_days(repos, since, until)
-    day_reports = build_day_reports(repos, since, until, window_days=effective_window_days, active_days=active_days)
+def build_ledger_from_day_reports(repos, notices, since, until, order, effective_window_days, windows, active_days, day_reports):
     calendar_day_count = (parse_date(until) - parse_date(since)).days + 1
     themes = merge_theme_candidates(day_reports)
     domain_day_records = build_domain_day_records(themes, order)
@@ -685,6 +728,47 @@ def build_ledger_payload(repos, notices, since, until, order, window_days=None):
         "domain_day_records": domain_day_records,
         "published_themes": domain_day_records,
     }
+
+
+def build_ledger_payload(repos, notices, since, until, order, window_days=None):
+    effective_window_days, windows = resolve_window_plan(since, until, window_days)
+    active_days = collect_active_days(repos, since, until)
+    day_reports = build_day_reports(repos, since, until, window_days=effective_window_days, active_days=active_days)
+    return build_ledger_from_day_reports(
+        repos,
+        notices,
+        since,
+        until,
+        order,
+        effective_window_days,
+        windows,
+        active_days,
+        day_reports,
+    )
+
+
+def build_context_payload(repos, notices, since, until, order, window_days=None):
+    effective_window_days, windows = resolve_window_plan(since, until, window_days)
+    active_days = collect_active_days(repos, since, until)
+    day_reports = build_day_reports(
+        repos,
+        since,
+        until,
+        window_days=effective_window_days,
+        active_days=active_days,
+        include_context=True,
+    )
+    return build_ledger_from_day_reports(
+        repos,
+        notices,
+        since,
+        until,
+        order,
+        effective_window_days,
+        windows,
+        active_days,
+        day_reports,
+    )
 
 
 def render_markdown(ledger):

@@ -5,7 +5,7 @@ import json
 import re
 import sys
 
-from changelog_guard import validate_file
+from changelog_guard import COMMIT_PREFIX_RE, find_technical_leaks, validate_file
 from context_fetcher import ABSTRACT_ENTRY_PATTERNS, ANCHOR_HINT_WORDS, build_anchor_candidates, candidate_similarity, detect_domain, extract_merge_terms, infer_feature_slot
 
 
@@ -19,6 +19,20 @@ CATEGORY_TO_RECORD_KIND = {
     "### 🔧 技术改造": "tech",
     "### 🐛 Bug 修复": "bugfix",
 }
+
+
+def normalize_generated_entries(payload):
+    if isinstance(payload, dict):
+        if isinstance(payload.get("entries"), list):
+            items = payload.get("entries") or []
+        else:
+            items = [
+                {"theme_id": key, "text": value}
+                for key, value in payload.items()
+            ]
+    else:
+        items = payload or []
+    return items
 
 
 def parse_entries(file_path):
@@ -133,6 +147,115 @@ def match_theme(entry, themes):
     return best_theme, best_score
 
 
+def theme_identity(theme):
+    return str(theme.get("theme_id") or theme.get("record_id") or "").strip()
+
+
+def has_theme_anchor(text, theme):
+    candidates = []
+    candidates.extend(theme.get("anchor_candidates") or [])
+    candidates.append(theme.get("theme_title"))
+    candidates.append(theme.get("domain_title"))
+    if any(candidate and str(candidate).strip() in text for candidate in candidates):
+        return True
+    return bool(re.search(r"(页面|模块|看板|列表|地图|配置|管理|入口|中心|流程)", text))
+
+
+def validate_generated_entries_payload(entries_payload, ledger):
+    errors = []
+    themes = ledger.get("domain_day_records") or ledger.get("published_themes") or []
+    theme_lookup = {
+        theme_identity(theme): theme
+        for theme in themes
+        if theme_identity(theme)
+    }
+    publishable_theme_ids = {
+        theme_id
+        for theme_id, theme in theme_lookup.items()
+        if theme.get("should_publish", True)
+    }
+
+    entries = normalize_generated_entries(entries_payload)
+    seen_theme_ids = {}
+    included_themes = []
+
+    for index, item in enumerate(entries, start=1):
+        theme_id = str((item or {}).get("theme_id") or "").strip()
+        text = str((item or {}).get("text") or (item or {}).get("entry") or "").strip()
+        label = f"theme_id `{theme_id or f'entry-{index}'}`"
+
+        if not theme_id:
+            errors.append(f"第 {index} 条：缺少 `theme_id`")
+            continue
+        if theme_id in seen_theme_ids:
+            errors.append(f"{label}：重复生成了多条结果")
+            continue
+        seen_theme_ids[theme_id] = index
+
+        theme = theme_lookup.get(theme_id)
+        if theme is None:
+            errors.append(f"{label}：未匹配到主题账本候选")
+            continue
+        if not theme.get("should_publish", True):
+            errors.append(f"{label}：命中了仅作支撑证据的主题，不应单列生成")
+            continue
+        if not text:
+            errors.append(f"{label}：生成结果为空")
+            continue
+
+        if any(re.search(pattern, text) for pattern in ABSTRACT_ENTRY_PATTERNS) and not has_theme_anchor(text, theme):
+            errors.append(f"{label}：条目表述过于抽象且缺少场景锚点 `{text}`")
+
+        if not has_theme_anchor(text, theme):
+            errors.append(f"{label}：条目缺少明确场景锚点 `{text}`")
+
+        commit_match = COMMIT_PREFIX_RE.search(text)
+        if commit_match:
+            errors.append(f"{label}：检测到 commit 风格表述 `{commit_match.group(0)}`")
+
+        for kind, token, hint in find_technical_leaks(f"- {text}"):
+            errors.append(f"{label}：检测到{kind} `{token}`；{hint}")
+
+        included_themes.append(theme)
+
+    missing_theme_ids = sorted(publishable_theme_ids - set(seen_theme_ids))
+    for theme_id in missing_theme_ids:
+        theme = theme_lookup.get(theme_id) or {}
+        title = theme.get("theme_title") or theme.get("domain_title") or theme_id
+        errors.append(f"theme_id `{theme_id}`：缺少生成结果 `{title}`")
+
+    seen_domain_date_kind = {}
+    matched_by_domain_date = {}
+    for theme in included_themes:
+        domain_day_kind = (theme.get("domain_key"), theme.get("delivery_date"), theme.get("record_kind"))
+        previous = seen_domain_date_kind.get(domain_day_kind)
+        theme_title = theme.get("theme_title") or theme.get("domain_title") or theme_identity(theme)
+        if previous:
+            errors.append(
+                f"theme_id `{theme_identity(theme)}`：功能域 `{theme_title}` 在 {theme.get('delivery_date')} 的 `{theme.get('record_kind')}` 已出现，不应重复写多条"
+            )
+        else:
+            seen_domain_date_kind[domain_day_kind] = theme_identity(theme)
+        matched_by_domain_date.setdefault((theme.get("domain_key"), theme.get("delivery_date")), []).append(theme)
+
+    for (_domain_key, delivery_date), matched_items in matched_by_domain_date.items():
+        if any(theme.get("record_kind") == "launch" for theme in matched_items) and len(matched_items) > 1:
+            domain_title = matched_items[0].get("theme_title") or matched_items[0].get("domain_title") or "未命名主题"
+            errors.append(
+                f"日期 `{delivery_date}` 的功能域 `{domain_title}` 存在新功能上线时，不应再同时输出同功能域的功能变更、技术改造或 Bug 修复"
+            )
+
+    return errors
+
+
+def validate_generated_entries_file(entries_path, ledger_path):
+    with open(entries_path, "r", encoding="utf-8") as f:
+        entries_payload = json.load(f)
+    with open(ledger_path, "r", encoding="utf-8") as f:
+        ledger = json.load(f)
+    return validate_generated_entries_payload(entries_payload, ledger)
+
+
 def validate_semantics(file_path, ledger_path, order):
     errors = []
     structure_errors = validate_file(file_path, order, check_tech=True)
@@ -207,20 +330,19 @@ def validate_semantics(file_path, ledger_path, order):
         if any(theme.get("record_kind") == "launch" for theme in day_themes) and len(matched_items) > 1:
             domain_title = matched_items[0][1].get("theme_title") or matched_items[0][1].get("domain_title") or domain_key
             errors.append(
-                f"日期 `{delivery_date}` 的功能域 `{domain_title}` 存在新功能上线时，不应再同时输出功能变更、技术改造或 Bug 修复"
+                f"日期 `{delivery_date}` 的功能域 `{domain_title}` 存在新功能上线时，不应再同时输出同功能域的功能变更、技术改造或 Bug 修复"
             )
 
     return errors
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate final changelog semantics against a merged theme ledger.")
-    parser.add_argument("--file", required=True, help="待校验的 changelog 文件路径")
+    parser = argparse.ArgumentParser(description="Validate model-written structured changelog entries against a merged theme ledger.")
+    parser.add_argument("--entries-file", required=True, help="宿主模型生成的 JSON 条目文件")
     parser.add_argument("--ledger", required=True, help="`changelog_draft.py` 生成的主题账本 JSON")
-    parser.add_argument("--order", choices=["asc", "desc", "any"], default="any", help="日期顺序要求")
     args = parser.parse_args()
 
-    errors = validate_semantics(args.file, args.ledger, args.order)
+    errors = validate_generated_entries_file(args.entries_file, args.ledger)
     if errors:
         print("CHANGELOG_SEMANTIC_GUARD_ERROR")
         for error in errors:

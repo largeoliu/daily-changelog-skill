@@ -135,12 +135,11 @@ def extract_scene_anchor(file_path, class_name, routes=None):
         if first_route:
             parts = [to_cn_scene_name(p) for p in first_route.split("/") if p and p not in {"api", "v1", "v2", "fix", "mq"}]
             parts = [p for p in parts if p]
-            if parts:
+            if parts and any(re.search(r"[\u4e00-\u9fff]", part) for part in parts):
                 return " / ".join(parts[:3]) + " 接口"
 
-    path_parts = re.split(r"[/_.-]", file_path)
     candidates = []
-    for part in path_parts + re.findall(r"[A-Z][a-z]+|[a-z]+", class_name):
+    for part in re.findall(r"[A-Z][a-z]+|[a-z]+", class_name):
         token = part.strip()
         if len(token) < 4:
             continue
@@ -151,7 +150,7 @@ def extract_scene_anchor(file_path, class_name, routes=None):
             continue
         candidates.append(to_cn_scene_name(token))
     candidates = [c for c in dedupe_keep_order(candidates) if c]
-    if candidates:
+    if candidates and any(re.search(r"[\u4e00-\u9fff]", candidate) for candidate in candidates):
         return " / ".join(candidates[:3]) + " 模块"
     return ""
 

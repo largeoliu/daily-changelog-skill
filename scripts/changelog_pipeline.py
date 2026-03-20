@@ -7,19 +7,19 @@ import shutil
 import sys
 import tempfile
 
-from changelog_assemble import ChangelogAssembleError, assemble_blocks
-from changelog_draft import build_ledger_payload, build_repo_fingerprint, render_markdown
-from changelog_generate import render_changelog
+from changelog_draft import build_context_payload, build_ledger_payload, render_markdown
+from changelog_generate import build_generation_packets, render_changelog_from_entries, render_context
 from changelog_guard import validate_file
-from changelog_semantic_guard import validate_semantics
+from changelog_semantic_guard import validate_generated_entries_file
 from context_fetcher import resolve_repo_inputs, resolve_since_value
 
 
 MANIFEST_FILENAME = "pipeline-manifest.json"
 LEDGER_FILENAME = "theme-ledger.json"
 THEMES_FILENAME = "themes.md"
+PACKETS_FILENAME = "entry-packets.json"
+ENTRIES_FILENAME = "generated-entries.json"
 DRAFT_FILENAME = "draft.md"
-ASSEMBLED_FILENAME = "assembled-final.md"
 
 
 class ChangelogPipelineError(Exception):
@@ -55,16 +55,6 @@ def atomic_copy(src, dest):
             os.remove(tmp_path)
 
 
-def max_markdown_mtime(target_dir):
-    latest = None
-    for name in os.listdir(target_dir):
-        if not name.endswith(".md"):
-            continue
-        current = os.path.getmtime(os.path.join(target_dir, name))
-        latest = current if latest is None else max(latest, current)
-    return latest
-
-
 def safe_remove_path(target_path):
     if not target_path or not os.path.exists(target_path):
         return
@@ -78,7 +68,7 @@ def prepare_pipeline(repos, notices, since, until, order, workdir):
     workdir = os.path.abspath(workdir)
     os.makedirs(workdir, exist_ok=True)
 
-    ledger = build_ledger_payload(repos, notices, since, until, order)
+    ledger = build_context_payload(repos, notices, since, until, order)
     ledger_path = os.path.join(workdir, LEDGER_FILENAME)
     themes_path = os.path.join(workdir, THEMES_FILENAME)
     manifest_path = os.path.join(workdir, MANIFEST_FILENAME)
@@ -142,96 +132,53 @@ def build_prepare_args_namespace(args):
     )
 
 
-def finalize_with_draft(workdir, draft_file, output, keep_artifacts=False):
+def generate_packets(workdir, output_path=None):
+    _manifest_path, manifest, ledger_path, ledger = load_manifest(workdir)
+    validate_ledger_consistency(_manifest_path, manifest, ledger_path, ledger)
+    output_path = os.path.abspath(output_path or os.path.join(os.path.abspath(workdir), PACKETS_FILENAME))
+    packets = build_generation_packets(ledger)
+    write_json(output_path, packets)
+    return output_path
+
+
+def finalize_with_entries(workdir, entries_file, output, keep_artifacts=False):
     _manifest_path, manifest, ledger_path, ledger = load_manifest(workdir)
     validate_ledger_consistency(_manifest_path, manifest, ledger_path, ledger)
 
-    draft_path = os.path.abspath(draft_file)
-    if not os.path.exists(draft_path):
-        raise ChangelogPipelineError(f"草稿文件不存在：{draft_path}")
-    if os.path.getmtime(draft_path) < os.path.getmtime(ledger_path):
-        raise ChangelogPipelineError("草稿文件早于当前主题账本，请先基于最新账本重生成草稿")
+    entries_path = os.path.abspath(entries_file)
+    if not os.path.exists(entries_path):
+        raise ChangelogPipelineError(f"生成条目文件不存在：{entries_path}")
+    if os.path.getmtime(entries_path) < os.path.getmtime(ledger_path):
+        raise ChangelogPipelineError("生成条目文件早于当前主题账本，请先基于最新账本重新生成条目")
+
+    semantic_errors = validate_generated_entries_file(entries_path, ledger_path)
+    if semantic_errors:
+        raise ChangelogPipelineError("\n".join(semantic_errors))
+
+    entries_payload = read_json(entries_path)
+    draft_path = os.path.join(os.path.abspath(workdir), DRAFT_FILENAME)
+    draft = render_changelog_from_entries(ledger, entries_payload)
+    write_text(draft_path, draft)
 
     structure_errors = validate_file(draft_path, manifest["order"], check_tech=True)
     if structure_errors:
         raise ChangelogPipelineError("\n".join(structure_errors))
 
-    semantic_errors = validate_semantics(draft_path, ledger_path, manifest["order"])
-    if semantic_errors:
-        raise ChangelogPipelineError("\n".join(semantic_errors))
-
     atomic_copy(draft_path, output)
-    if not keep_artifacts:
-        assembled_path = os.path.join(os.path.abspath(workdir), ASSEMBLED_FILENAME)
-        if os.path.exists(assembled_path):
-            os.remove(assembled_path)
+    if not keep_artifacts and os.path.exists(draft_path):
+        os.remove(draft_path)
     return os.path.abspath(output)
 
 
-def finalize_with_blocks(workdir, blocks_dir, output, keep_artifacts=False):
-    manifest_path, manifest, ledger_path, ledger = load_manifest(workdir)
-    validate_ledger_consistency(manifest_path, manifest, ledger_path, ledger)
-
-    blocks_dir = os.path.abspath(blocks_dir)
-    if not os.path.isdir(blocks_dir):
-        raise ChangelogPipelineError(f"单日块目录不存在：{blocks_dir}")
-    latest_block_mtime = max_markdown_mtime(blocks_dir)
-    if latest_block_mtime is None:
-        raise ChangelogPipelineError(f"单日块目录为空：{blocks_dir}")
-    if latest_block_mtime < os.path.getmtime(ledger_path):
-        raise ChangelogPipelineError("单日块早于当前主题账本，请先基于最新账本重生成日期块")
-
-    assembled_path = os.path.join(os.path.abspath(workdir), ASSEMBLED_FILENAME)
-    try:
-        assemble_blocks(blocks_dir, assembled_path, order=manifest["order"], cleanup_dir=None, keep_temp=True)
-    except ChangelogAssembleError as exc:
-        raise ChangelogPipelineError(str(exc)) from exc
-
-    semantic_errors = validate_semantics(assembled_path, ledger_path, manifest["order"])
-    if semantic_errors:
-        raise ChangelogPipelineError("\n".join(semantic_errors))
-
-    atomic_copy(assembled_path, output)
-    if not keep_artifacts and os.path.exists(assembled_path):
-        os.remove(assembled_path)
-    return os.path.abspath(output)
-
-
-def generate_draft(workdir, output_path=None):
-    _manifest_path, manifest, ledger_path, ledger = load_manifest(workdir)
-    validate_ledger_consistency(_manifest_path, manifest, ledger_path, ledger)
-    output_path = os.path.abspath(output_path or os.path.join(os.path.abspath(workdir), DRAFT_FILENAME))
-    draft = render_changelog(ledger)
-    write_text(output_path, draft)
-    return output_path
+def build_context_output(repos, notices, since, until, order):
+    ledger = build_context_payload(repos, notices, since, until, order)
+    return render_context(ledger)
 
 
 def run_pipeline(repos, notices, since, until, order, output, workdir=None, keep_artifacts=False):
-    temp_workdir = None
-    if workdir:
-        pipeline_workdir = os.path.abspath(workdir)
-        os.makedirs(pipeline_workdir, exist_ok=True)
-    else:
-        temp_workdir = tempfile.mkdtemp(prefix="daily-changelog-pipeline-")
-        pipeline_workdir = temp_workdir
-
-    try:
-        prepare_pipeline(repos, notices, since, until, order, pipeline_workdir)
-        draft_path = generate_draft(pipeline_workdir)
-        final_path = finalize_with_draft(
-            pipeline_workdir,
-            draft_path,
-            output,
-            keep_artifacts=keep_artifacts or bool(workdir),
-        )
-        if temp_workdir and not keep_artifacts:
-            safe_remove_path(temp_workdir)
-            temp_workdir = None
-        return final_path, pipeline_workdir
-    except Exception:
-        if temp_workdir and not keep_artifacts:
-            safe_remove_path(temp_workdir)
-        raise
+    raise ChangelogPipelineError(
+        "`run` 黑盒模式已移除；当前流程需要 skill 内部先 prepare 生成写作包，再由宿主模型生成条目，最后 finalize。"
+    )
 
 
 def prepare_main(args):
@@ -257,44 +204,21 @@ def prepare_main(args):
 
 
 def finalize_main(args):
-    if bool(args.draft_file) == bool(args.blocks_dir):
-        raise ChangelogPipelineError("必须且只能提供 `--draft-file` 或 `--blocks-dir` 其中一个")
-    if args.draft_file:
-        output_path = finalize_with_draft(args.workdir, args.draft_file, args.output, keep_artifacts=args.keep_artifacts)
-    else:
-        output_path = finalize_with_blocks(args.workdir, args.blocks_dir, args.output, keep_artifacts=args.keep_artifacts)
+    output_path = finalize_with_entries(args.workdir, args.entries_file, args.output, keep_artifacts=args.keep_artifacts)
     print("CHANGELOG_PIPELINE_FINALIZE_OK")
     print(output_path)
 
 
 def generate_main(args):
-    draft_path = generate_draft(args.workdir, args.output)
+    packets_path = generate_packets(args.workdir, args.output)
     print("CHANGELOG_PIPELINE_GENERATE_OK")
-    print(draft_path)
+    print(packets_path)
 
 
 def run_main(args):
-    repos, notices, errors = resolve_repo_inputs(build_prepare_args_namespace(args))
-    if errors:
-        raise ChangelogPipelineError("\n".join(errors))
-
-    since, date_notices = resolve_since_value(args.since, repos)
-    notices.extend(date_notices)
-    until = args.until or since
-    final_path, pipeline_workdir = run_pipeline(
-        repos,
-        notices,
-        since,
-        until,
-        args.order,
-        args.output,
-        workdir=args.workdir,
-        keep_artifacts=args.keep_artifacts,
+    raise ChangelogPipelineError(
+        "`run` 黑盒模式已移除；请在 skill 内部使用 prepare -> generate -> finalize 流程。"
     )
-    print("CHANGELOG_PIPELINE_RUN_OK")
-    print(final_path)
-    if args.keep_artifacts or args.workdir:
-        print(pipeline_workdir)
 
 
 def main():
@@ -310,7 +234,7 @@ def main():
     prepare_parser.add_argument("--order", choices=["asc", "desc"], default="desc", help="日期顺序")
     prepare_parser.add_argument("--workdir", required=True, help="pipeline 工作目录")
 
-    run_parser = subparsers.add_parser("run", help="黑盒生成最终 changelog；内部自动执行 prepare/generate/finalize")
+    run_parser = subparsers.add_parser("run", help="已废弃；当前 skill 需要宿主模型参与逐条写作")
     run_parser.add_argument("--since", default=None, help="开始日期；支持 YYYY-MM-DD、earliest、auto")
     run_parser.add_argument("--until", default=None, help="结束日期；默认与 --since 相同")
     run_parser.add_argument("--repo-path", default=None, help="单个仓库路径，或包含多个子仓库的项目目录")
@@ -321,16 +245,15 @@ def main():
     run_parser.add_argument("--workdir", help="可选调试工作目录；默认自动创建并清理")
     run_parser.add_argument("--keep-artifacts", action="store_true", help="保留中间产物；默认在自动工作目录下清理")
 
-    generate_parser = subparsers.add_parser("generate", help="基于最新主题账本自动生成草稿")
+    generate_parser = subparsers.add_parser("generate", help="基于最新主题账本生成逐条写作包")
     generate_parser.add_argument("--workdir", required=True, help="prepare 阶段生成的 pipeline 工作目录")
-    generate_parser.add_argument("--output", help="草稿输出路径；默认写到 workdir/draft.md")
+    generate_parser.add_argument("--output", help=f"写作包输出路径；默认写到 workdir/{PACKETS_FILENAME}")
 
-    finalize_parser = subparsers.add_parser("finalize", help="基于最新 manifest 和主题账本校验并落盘最终 changelog")
+    finalize_parser = subparsers.add_parser("finalize", help="基于主题账本和宿主模型生成的条目校验并落盘最终 changelog")
     finalize_parser.add_argument("--workdir", required=True, help="prepare 阶段生成的 pipeline 工作目录")
-    finalize_parser.add_argument("--draft-file", help="基于最新主题账本生成的最终草稿文件")
-    finalize_parser.add_argument("--blocks-dir", help="基于最新主题账本生成的单日块目录")
+    finalize_parser.add_argument("--entries-file", required=True, help="宿主模型生成的 JSON 条目文件")
     finalize_parser.add_argument("--output", required=True, help="最终 changelog 输出文件")
-    finalize_parser.add_argument("--keep-artifacts", action="store_true", help="保留 assembled 中间文件")
+    finalize_parser.add_argument("--keep-artifacts", action="store_true", help=f"保留 {DRAFT_FILENAME} 中间文件")
 
     args = parser.parse_args()
     try:
